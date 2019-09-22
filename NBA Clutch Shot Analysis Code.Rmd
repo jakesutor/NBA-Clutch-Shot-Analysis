@@ -1,0 +1,228 @@
+---
+title: "NBA Analysis"
+author: "Jake Sutor"
+date: "September 22, 2019"
+output: pdf_document
+---
+
+library("tinytex")
+
+```{r, include=FALSE}
+devtools::install_github('yihui/tinytex')
+options(tinytex.verbose = TRUE)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#NBA Shots Analysis
+
+```{r}
+#Set working directory and input Shot Logs dataset
+setwd("C:/Users/jakes/Documents/DAEN/Summer 2019/Big Data to Information")
+```
+
+```{r}
+library(DBI)
+library(RSQLite)
+library(odbc)
+con = dbConnect(RSQLite::SQLite(), dbname = "NBAShotLog")
+nba <- read.csv("shot_logs.csv", stringsAsFactors = F)
+```
+
+##Summary Statistics
+
+The first thing we will do in our analysis is look at the data. To do so, we will analyze the full data set to understand the variables present in our data set. This will also help us understand any data that needs to be cleaned.
+
+```{r}
+summary(nba)
+```
+
+One of the first things that seems to be incorrect is that some Touch Time rows have negative values. As negative time is not possible, we can omit these as errors.
+```{r}
+nba = nba[nba$TOUCH_TIME > 0,]
+summary(nba)
+```
+
+We will also look at the data types in order to understand what visualizations are appropriate for each variable.
+```{r}
+str(nba)
+```
+
+Next, we will call the packages that will likely be required for this analysis.
+
+```{r}
+library(ggplot2)
+library(readr)
+library(repr)
+library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+```
+
+
+##SQL Schema
+
+Now that we understand the full dataset, we will take a closer look at this data by running a few SQL-based queries to understand our data a little better.
+
+```{sql connection=con}
+SELECT COUNT(DISTINCT player_name)
+FROM nba;
+```
+
+This shows us there are 281 players represented in this dataset. We can also investigate this dataset to understand what the different responses are within the variable SHOT_RESULT.
+
+```{sql connection=con}
+SELECT DISTINCT SHOT_RESULT
+FROM nba;
+```
+
+This reveals that SHOT_RESULT is equal to either made or missed, meaning that either the shot taken scored a basket or did not. We can also sum up the total points scored by players throughout this season and select the top 10 scorers of this season.
+
+```{sql connection=con}
+SELECT player_name,
+  SUM(PTS) AS total_points
+FROM nba
+GROUP BY player_name
+ORDER BY SUM(PTS)
+DESC LIMIT 10;
+```
+
+We see that Steph Curry, James Harden, Klay Thompson, and Lebron James are the top 4 scorers - which is unsuprising as they are some of the best players and shooters in the NBA.
+
+Another interesting query we can run is to see which players typically take their shots latest in the shot clock - meaning these players typically take shots closer to when the clock is going to run out before their team has to take a shot or lose the ball. It will be interesting to see whether any of these players show up in our further anlaysis of "clutch" shots, which are those made late in the game rather than just thoseshots taken late in the shot clock, which resets with each change of possession.
+
+```{sql connection=con}
+SELECT player_name,
+  ROUND(AVG(SHOT_CLOCK), 2) AS avg_shotclock
+FROM nba
+GROUP BY player_name
+ORDER BY AVG(SHOT_CLOCK)
+ASC LIMIT 10;
+```
+
+
+##Scatterplot of Margin of Victory
+
+In order to understand what shots may be considered clutch, we should look at the margin of victory to understand which shots are being taken in games that actually matter. If a game has a huge margin of victory - meaning the winning team won by a lot - then the final shots of the game are not as important, as they will not affect the outcome of the game. 
+
+```{r}
+plot(nba$FINAL_MARGIN, main = "Final Margin of Victory", ylab = "Margin of Victory", xlab = "Shot ID")
+```
+
+When we look at this graph, we see some games that had very large margins of victory, with some even greater than 40 points. We will define clutch shots as shots taken late in games when there is a lot on the line. If we limit our analysis to only shots taken with a final margin of victory of 5 points or less during the last minute of the final quarter of a game, we will understand which shots are actually relevant in our analysis of "clutch" shots.
+
+First, we will have to convert our game clock to a numeric variable so that we can analyze this to determine which shots are considered to be "clutch" based on being taken late in the game ("Analyzing the Best Defenders in the NBA").
+
+```{r}
+nba$GAME_CLOCK = as.character(nba$GAME_CLOCK)
+nba$GAME_CLOCK = gsub(":", ".", nba$GAME_CLOCK)
+nba$GAME_CLOCK = as.numeric(nba$GAME_CLOCK)
+```
+
+Next, we graph the data limited to just these last minute shots in close games.
+
+```{r}
+plot(nba$FINAL_MARGIN[nba$GAME_CLOCK <= 1 & nba$PERIOD >= 4 & abs(nba$FINAL_MARGIN) <= 5], main = "Scatter Plot of Clutch Shots", ylab = "Margin of Victory", xlab = "Shot ID")
+```
+
+This still reveals a very high number of shots being taken in these situations, which suggests that we will have enough data to analyze. This subset of the data are for shots taken in "clutch" situations when the result of a game is on the line based on the results of these final shots.
+
+Next, we can create a new variable for shots that are classified as clutch shots. Then, we will develop a new dataframe for only these shots.
+
+```{r}
+nba$clutch = 0
+nba$clutch[nba$GAME_CLOCK <= 1 & nba$PERIOD >= 4 & abs(nba$FINAL_MARGIN) <= 5] = 1
+nba$clutch_made = 0
+nba$clutch_made[nba$clutch >= 1 & nba$SHOT_RESULT == "made"] = 1
+
+clutchtime <- nba %>% group_by(player_name) %>% mutate(FGA = 1) %>% mutate(clutch_made = ifelse(grepl("made", SHOT_RESULT) & grepl(1, clutch), 1, 0)) %>% 
+  summarise (gp = length(unique(GAME_ID)), clutchshots = sum(clutch), totclutch_made = sum(clutch_made), clutch_fgpct = totclutch_made/clutchshots, fga = sum(FGA), fgaPerGame = sum(FGA)/gp, fgm = sum(FGM), fgperc = fgm/fga, totpts = sum(PTS), ppg = sum(PTS)/gp)
+str(clutchtime)
+
+```
+
+Having developed this new dataframe, we can now limit our dataset to include only players that have taken clutchshots this season. 
+
+```{r}
+clutchtime <- clutchtime[which(clutchtime$clutchshots >= 1),]
+clutchtime
+str(clutchtime)
+```
+
+##Data Visualization
+
+Now, to plot this data. 
+
+```{r}
+ggplot(clutchtime, aes(clutchshots, totclutch_made, col = clutch_fgpct)) + geom_point(size = 4, alpha = .3) + 
+  geom_text(aes(label = ifelse(clutchshots>20|totclutch_made>10, player_name, ""))) + 
+  geom_text(aes(label = ifelse(clutch_fgpct>.6 & clutchshots>10, player_name, ""))) + 
+  geom_text(aes(label = ifelse(clutchshots>=10 & totclutch_made<=0, player_name, ""))) +
+  scale_color_gradient(low = "darkblue", high = "darkgreen") + 
+  xlab("Clutch Shots") +
+  ylab("Clutch Shots Made")
+```
+
+This appears to show us that Kyle Lowry has taken the most clutch shots, but Markieff Morris, Carmelo Anthony, and James Harden have made the highest number of shots at a high percentage. On the other end of the spectrum, Rudy Gay has taken 10 clutch shots but has yet to make a single one, suggesting he must be one of the least clutch players in the league.
+
+##Boxplot
+
+A boxplot of this data also provides an interesting visualization of this information and aligns with what we see above. In a boxplot of the number of clutch shots made by players, it appears the vast majority of players are making 3 or fewer clutch shots this season, with a handful of players having made significantly more. This information makes the top clutch shot makers even more interesting to study given how unique it is for players to make so many shots in the last minute of close games.
+
+```{r}
+boxplot(clutchtime$totclutch_made, main = "BoxPlot of Clutch Shots Made", ylab = "Number of Clutch Shots Made")
+```
+
+
+##Correlations
+
+Now, I want to analyze the correlations between the data to see if any of the other variables we have selected have a correlation with the number of clutch shots made by players. I will need to first limit my analysis to quantitative variables and then we can study the correlation between the variables that we have limited to our clutch dataframe.
+
+```{r}
+library(corrplot)
+clutchtime.corr = clutchtime[,2:length(clutchtime)]
+clutchtime.cordata = round(cor(clutchtime.corr),2)
+clutchtime.cordata
+corrplot(clutchtime.cordata)
+```
+
+Interestingly, there appears to be some correlation between the number of clutch shots taken (as well as the number made) with most of the other variables besides the number of games played and the player's average field goal percentage across the season. 
+
+##Regression Analysis
+
+Let's study these relationships in further detail to understand how statistically significant these relationships are. I think it would be most interesting to see if the number of clutch shots made is correlated with and dependent on these other variables. We will however omit clutch field goal percent and clutch shots as these are clearly correlated with the total number of clutch shots made - if you take more shots, you will have a chance to make more, and the percentage of made shots is interconnected with the total number made. So we will need to omit these in order to attempt to remain true to the assumption that there is no autocorrelation.
+
+```{r}
+linearmodel <- lm(totclutch_made ~ gp + fga + fgaPerGame + fgm + fgperc + totpts + ppg, data=clutchtime)
+summary(linearmodel)
+```
+
+Unfortunately, there's not a lot going on here in terms of correlation. We can drop ppg as that has the highest p value and is therefore least correlated.
+
+```{r}
+linearmodel2 <- lm(totclutch_made ~ gp + fga + fgaPerGame + fgm + fgperc + totpts, data=clutchtime)
+summary(linearmodel2)
+```
+
+We still see very little correlation, and as we continue breaking this down, we see the only variable significantly correlated with the total number of clutch shots made is the total number of field goals attempted by players.
+
+```{r}
+linearmodel3 <- lm(totclutch_made ~ fga, data=clutchtime)
+summary(linearmodel3)
+```
+
+This suggests that the number of clutch shots made by a player is only highly correlated with the number of field goal attempts made. This makes logical sense as players that take more shots would seem to be more likely to take, and therefore make, shots during the end of close games. Furthermore, this means that players who hit more clutch shots are not necessarily players that have a high field goal percentage throughout the rest of the season. This makes sense, as, referring back to our original visualization of clutch shots, Kyle Lowry and Carmelo Anthony are toward the top in terms of clutch shots made, but they both typically have low shooting percentages throughout the season - but both players take a very high number of shots. 
+
+##Conclusions
+
+Thus, out of all of these variables, it appears that the number of shots taken by a player throughout the season is the best indicator of how many clutch shots a player will make in the season. This could be helpful for teams in the NBA, as when the coaches decide the final play of the game, they may want to try to get the ball to their player who typically takes the most shots as they appear most likely to make a high number of these last minute shots. Additionally, we have seen that Markieff Morris, Carmelo Anthony, Monta Ellis, Kyle Lowry, and Kemba Walker made the most clutch shots this season. Additionally of note, is that of players to have made 8 or more of these types of shots, James Harden had the highest percentage of made shots. These players can be considered the most clutch players in the NBA based on analysis of this data from the 2014-15 season. 
+
+
+#References
+
+DanB. “NBA Shot Logs.” Kaggle, 18 Aug. 2016, www.kaggle.com/dansbecker/nba-shot-logs. 
+
+NBA.com. “NBA Stats.” NBA Stats, stats.nba.com/.
